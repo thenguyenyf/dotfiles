@@ -16,9 +16,11 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log() { printf '[dotfiles] %s\n' "$*"; }
 
-# 1) Install bash completions into the user bash-completion dir, where the
-#    image's default .bashrc (via bash_completion) lazy-loads them by command
-#    name. Files are named `git`/`west` so the loader finds them.
+# 1) Symlink vendored completion scripts into the user bash-completion dir,
+#    named `git`/`west` so bash_completion's lazy loader would find them by
+#    command name. This is the single source of truth for step 2 (which
+#    sources everything in this dir directly), and stays correct on images
+#    where bash_completion *is* installed.
 COMP_DIR="$HOME/.local/share/bash-completion/completions"
 mkdir -p "$COMP_DIR"
 for spec in "git:.git-completion.bash" "west:.west-completion.bash"; do
@@ -36,7 +38,46 @@ for spec in "git:.git-completion.bash" "west:.west-completion.bash"; do
     log "linked $dst -> $src"
 done
 
-# 2) Install recommended VS Code extensions where VS Code actually reads them:
+# 2) Make the completions actually load. The image's .bashrc sources the
+#    `bash_completion` lazy-loader *only if it is installed*, but this image
+#    ships the completion data (/usr/share/bash-completion/completions/)
+#    without the loader (/usr/share/bash-completion/bash_completion), so the
+#    user dir is never lazy-loaded. Instead, append a marker-delimited block
+#    to ~/.bashrc that sources every script in $COMP_DIR directly — each is
+#    self-contained (defines its own helpers and ends in `complete -F ...`),
+#    so it works with or without bash_completion. The block is replaced (not
+#    duplicated) on every run, keeping this idempotent.
+install_bashrc_hook() {
+    local bashrc="$HOME/.bashrc"
+    local start="# >>> dotfiles/bash-completions >>>"
+    local end="# <<< dotfiles/bash-completions <<<"
+
+    # Drop any block left by a previous run, then strip the trailing blank
+    # lines it left behind so repeated runs leave the file byte-identical.
+    if [ -f "$bashrc" ]; then
+        if grep -qF "$start" "$bashrc"; then
+            sed -i "\|^${start}$|,\|^${end}$|d" "$bashrc"
+        fi
+        # Remove trailing blank lines (GNU sed idiom).
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$bashrc"
+    fi
+
+    # Append a fresh block (also creates ~/.bashrc if it was absent).
+    {
+        printf '\n%s\n' "$start"
+        cat <<'EOF'
+for _f in "$HOME"/.local/share/bash-completion/completions/*; do
+    [ -r "$_f" ] && . "$_f"
+done
+unset _f
+EOF
+        printf '%s\n' "$end"
+    } >> "$bashrc"
+    log "ensured ~/.bashrc sources completions from $COMP_DIR"
+}
+install_bashrc_hook
+
+# 3) Install recommended VS Code extensions where VS Code actually reads them:
 #    <workspace-root>/.vscode/extensions.json. (NOT ~/.vscode-server/extensions/,
 #    which is the server's own installed-extension metadata and is ignored for
 #    recommendations.) Re-copied on every start, so a dotfiles update
